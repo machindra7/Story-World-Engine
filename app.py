@@ -1,6 +1,9 @@
 import html
+import json
 import os
 import re
+import urllib.error
+import urllib.request
 import torch
 import streamlit as st
 import streamlit.components.v1 as components
@@ -18,6 +21,9 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
 
 @st.cache_resource
 def load_extractor():
@@ -26,7 +32,7 @@ def load_extractor():
 
 @st.cache_resource
 def load_language_model(model_id: str):
-    """Loads any user-specified Hugging Face causal language model."""
+    """Loads any user-specified Hugging Face causal language model for local inference."""
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -36,9 +42,121 @@ def load_language_model(model_id: str):
     return tokenizer, model
 
 
-def generate_text(prompt: str, model_id: str, max_tokens: int = 220) -> str:
-    """Runs inference using the configured model ID."""
-    tokenizer, model = load_language_model(model_id)
+def _get_active_api_key() -> str:
+    """Returns the configured API key from Setup or environment variables."""
+    return (
+        st.session_state.get("api_key", "").strip()
+        or os.getenv("GEMINI_API_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+        or os.getenv("STORY_API_KEY", "").strip()
+    )
+
+
+def _get_effective_model_name() -> str:
+    """Resolves the active model name from Setup or defaults based on the configured API key."""
+    custom_model = st.session_state.get("model_id", "").strip()
+    if custom_model:
+        return custom_model
+    api_key = _get_active_api_key()
+    if not api_key:
+        return ""
+    if api_key.startswith("sk-"):
+        return DEFAULT_OPENAI_MODEL
+    return DEFAULT_GEMINI_MODEL
+
+
+def _call_openai_compatible_api(prompt: str, api_key: str, model_name: str, max_tokens: int) -> str:
+    """Calls OpenAI-compatible chat completions endpoint via standard library HTTPS."""
+    url = "https://api.openai.com/v1/chat/completions"
+    payload = json.dumps(
+        {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.85,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        choices = body.get("choices", [])
+        if choices:
+            return (choices[0].get("message", {}).get("content") or "").strip()
+        return ""
+    except urllib.error.HTTPError as http_err:
+        err_detail = http_err.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"API HTTP {http_err.code}: {err_detail}") from http_err
+
+
+def _call_gemini_api(prompt: str, api_key: str, model_name: str, max_tokens: int) -> str:
+    """Calls Gemini via google-genai SDK if installed, falling back to standard library HTTPS."""
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+                temperature=0.85,
+            ),
+        )
+        return (response.text or "").strip()
+    except ModuleNotFoundError:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_name}:generateContent?key={api_key}"
+        )
+        payload = json.dumps(
+            {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "maxOutputTokens": max_tokens,
+                    "temperature": 0.85,
+                },
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            candidates = body.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                return "".join(p.get("text", "") for p in parts).strip()
+            return ""
+        except urllib.error.HTTPError as http_err:
+            err_detail = http_err.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"Gemini API HTTP {http_err.code}: {err_detail}") from http_err
+
+
+def generate_text(prompt: str, model_id: str = "", max_tokens: int = 220) -> str:
+    """Runs inference using the configured API key (defaulting to a cloud model) or local HF model."""
+    api_key = _get_active_api_key()
+    effective_model = model_id.strip() or _get_effective_model_name()
+
+    if api_key:
+        if api_key.startswith("sk-"):
+            return _call_openai_compatible_api(prompt, api_key, effective_model, max_tokens)
+        return _call_gemini_api(prompt, api_key, effective_model, max_tokens)
+
+    tokenizer, model = load_language_model(effective_model)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     with torch.no_grad():
         outputs = model.generate(
@@ -54,7 +172,7 @@ def generate_text(prompt: str, model_id: str, max_tokens: int = 220) -> str:
 
 
 def build_dry_run_suggestions(character_states: dict, batch_index: int = 0) -> list[dict]:
-    """Generates varied 2-sentence canon-aware scene ideas across refresh clicks when no model ID is set."""
+    """Generates varied 2-sentence canon-aware scene ideas across refresh clicks when no API key/model is set."""
     if not character_states:
         blank_sets = [
             [
@@ -177,7 +295,7 @@ def _refresh_chapter_summary(chap_num: int) -> None:
         passages=chap["passages"],
         chapter_facts=chap_facts,
         generate_fn=generate_text,
-        model_id=st.session_state.model_id,
+        model_id=_get_effective_model_name(),
     )
 
 
@@ -511,6 +629,12 @@ if "scene_suggestions" not in st.session_state:
     st.session_state.scene_suggestions = []
 if "suggestion_history" not in st.session_state:
     st.session_state.suggestion_history = []
+if "api_key" not in st.session_state:
+    st.session_state.api_key = (
+        os.getenv("GEMINI_API_KEY", "")
+        or os.getenv("OPENAI_API_KEY", "")
+        or os.getenv("STORY_API_KEY", "")
+    )
 if "model_id" not in st.session_state:
     st.session_state.model_id = os.getenv("STORY_MODEL_ID", "")
 if "max_tokens" not in st.session_state:
@@ -1115,8 +1239,10 @@ with top_left:
 
 with top_right:
     ctrl_spacer, ctrl_status, ctrl_model, ctrl_cfg, ctrl_reset = st.columns([1.2, 2.2, 2.3, 1.3, 1.8])
+    effective_model = _get_effective_model_name()
+
     with ctrl_status:
-        if st.session_state.model_id.strip():
+        if effective_model:
             st.markdown(
                 '<div class="top-meta-bar"><span class="status-pill"><span class="dot-green"></span>Advisor active</span><div class="v-divider"></div></div>',
                 unsafe_allow_html=True,
@@ -1129,15 +1255,15 @@ with top_right:
 
     with ctrl_model:
         display_model = (
-            st.session_state.model_id.split("/")[-1]
-            if st.session_state.model_id.strip()
+            effective_model.split("/")[-1]
+            if effective_model
             else "Unassigned"
         )
         st.markdown(
             f"""
             <div class="model-meta" style="padding-top:3px;">
                 <span class="model-eyebrow">SCENE ADVISOR</span>
-                <span class="model-name" title="{html.escape(st.session_state.model_id or 'No model configured')}">{html.escape(display_model)}</span>
+                <span class="model-name" title="{html.escape(effective_model or 'No API key or model configured')}">{html.escape(display_model)}</span>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1145,18 +1271,25 @@ with top_right:
 
     with ctrl_cfg:
         with st.popover("Setup"):
-            st.caption("Configure your Hugging Face model ID and story metadata.")
+            st.caption("Add your API key (uses default cloud model) or specify a custom model ID.")
+            new_api_key = st.text_input(
+                "API Key",
+                value=st.session_state.api_key,
+                type="password",
+                placeholder="Paste Gemini or OpenAI API key...",
+            )
             new_model = st.text_input(
-                "Model ID",
+                "Model ID (Optional)",
                 value=st.session_state.model_id,
-                placeholder="Paste model ID here...",
+                placeholder="Auto: gemini-2.5-flash (or HF model ID)",
             )
             new_title = st.text_input("Story Title", value=st.session_state.story_title)
             new_logline = st.text_input("Logline", value=st.session_state.story_logline)
             new_tokens = st.slider("Max Tokens", 80, 512, st.session_state.max_tokens, 20)
 
             if st.button("Apply Settings", use_container_width=True):
-                st.session_state.model_id = new_model
+                st.session_state.api_key = new_api_key.strip()
+                st.session_state.model_id = new_model.strip()
                 st.session_state.story_title = new_title or "Untitled Chronicle"
                 st.session_state.story_logline = new_logline
                 st.session_state.max_tokens = new_tokens
@@ -1557,15 +1690,20 @@ else:
                         avoid_clause = f"Avoid repeating these earlier ideas: {', '.join(prev_titles[-6:])}."
                         combined_note = f"{combined_note} {avoid_clause}".strip()
 
+                    active_model = _get_effective_model_name()
                     with st.spinner("Generating fresh scene ideas..."):
-                        if st.session_state.model_id.strip():
+                        if active_model:
                             try:
                                 sug_prompt = st.session_state.prompt_engine.build_scene_suggestion_prompt(
                                     active_facts=all_facts,
                                     context_chunks=recent_chunks,
                                     writer_note=combined_note,
                                 )
-                                raw_sug = generate_text(sug_prompt, st.session_state.model_id.strip(), max_tokens=240)
+                                raw_sug = generate_text(
+                                    sug_prompt,
+                                    active_model,
+                                    max_tokens=st.session_state.max_tokens,
+                                )
                                 parsed = st.session_state.prompt_engine.parse_scene_suggestions(raw_sug)
                                 new_ideas = parsed or build_dry_run_suggestions(
                                     st.session_state.graph_manager.get_character_states(),
@@ -1652,8 +1790,8 @@ else:
 st.markdown(
     """
     <div class="page-footer">
-        <span>SCENE ADVISOR &nbsp;•&nbsp; WIDESCREEN KNOWLEDGE GRAPH</span>
-        <span>STORY WORLD ENGINE V2.7</span>
+        <span>SCENE ADVISOR &nbsp;•&nbsp; API KEY & LOCAL MODEL READY</span>
+        <span>STORY WORLD ENGINE V2.8</span>
     </div>
     """,
     unsafe_allow_html=True,
